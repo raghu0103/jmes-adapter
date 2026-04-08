@@ -1,0 +1,138 @@
+version: 1.0
+
+vendor: SMAX
+
+operations:
+
+  smax_ticket_list:
+    operation:
+      type: REST
+      details:
+        route: "https://decurrent-archiplasmic-myrtle.ngrok-free.dev/tickets/ticket-list"
+        method: GET
+        timeout: 20
+        headers:
+          required:
+            Content-Type: "application/json"
+          runtime:
+            Authorization: "${auth_token}"
+
+    response:
+      expression: >
+        entities[].{
+          id: properties.Id,
+          title: properties.DisplayLabel || 'NA',
+          description: properties.Description || '',
+          status: properties.Status || 'Unknown',
+          priority: properties.Priority || 'NA',
+          created_at: properties.CreateTime || properties.EmsCreationTime,
+          updated_at: properties.LastUpdateTime || null,
+          requested_by: properties.RequestedByPerson || null,
+          assignment: properties.CurrentAssignment || 'Unassigned'
+        }
+
+
+  smax_ticket_summary:
+    operation:
+      type: REST
+      details:
+        route: "https://decurrent-archiplasmic-myrtle.ngrok-free.dev/tickets/full-layout/${ticket_id}"
+        method: GET
+        timeout: 20
+        headers:
+          required:
+            Content-Type: "application/json"
+          runtime:
+            Authorization: "${auth_token}"
+
+    response:
+      expression: >
+        {
+          id: properties.Id,
+          title: properties.DisplayLabel || 'NA',
+          description: properties.Description || '',
+          status: properties.Status || 'Unknown',
+          priority: properties.Priority || 'NA',
+          created_at: properties.CreateTime || properties.EmsCreationTime,
+          updated_at: properties.LastUpdateTime || null,
+          requested_by: properties.RequestedByPerson || null,
+          requested_for: properties.RequestedForPerson || null,
+          assignment: properties.CurrentAssignment || 'Unassigned',
+          phase: properties.PhaseId || null,
+          sla_status: related_properties.SLT.Status || 'Unknown',
+          sla_target: related_properties.SLT.TargetDate || null,
+          sla_target_date: related_properties.SLT.SLATargetDate || null,
+          ola_target: related_properties.SLT.OLATargetDate || null
+        }
+
+
+  smax_ticket_comments:
+    operation:
+      type: REST
+      details:
+        route: "https://decurrent-archiplasmic-myrtle.ngrok-free.dev/tickets/comments-list"
+        method: GET
+        timeout: 20
+        headers:
+          required:
+            Content-Type: "application/json"
+          runtime:
+            Authorization: "${auth_token}"
+
+    response:
+      selector: "${ticket_id}"
+      expression: >
+        [].{
+          id: Id,
+          body: Body || '',
+          comment_type: CommentFrom || 'Unknown',
+          author: Submitter.UserId || 'Unknown',
+          is_system: IsSystem || false,
+          created_at: CreateTime || null,
+          updated_at: UpdateTime || null,
+          functional_type: FunctionalPurpose || null,
+          media: Media || null
+        }
+
+  smax_all_comments:
+    operation:
+      type: REST
+      details:
+        route: "https://decurrent-archiplasmic-myrtle.ngrok-free.dev/tickets/comments-list"
+        method: GET
+        headers:
+          required:
+            Content-Type: "application/json"
+          runtime:
+            Authorization: "${auth_token}"
+
+    response:
+      expression: >
+        values(@)[].{
+          id: Id,
+          body: Body,
+          comment_type: CommentFrom,
+          author: Submitter.UserId,
+          is_system: IsSystem,
+          created_at: CreateTime,
+          updated_at: UpdateTime,
+          functional_type: FunctionalPurpose,
+          media: Media
+        }
+
+  smax_ticket_full:
+    steps:
+      - name: ticket
+        operation: smax_ticket_summary
+      - name: comments
+        operation: smax_ticket_comments
+      - name: comments_if_open
+        operation: smax_ticket_comments
+        condition: ticket[0].status != 'RequestStatusComplete'
+    response:
+      expression: >
+        {
+          ticket: ticket[0],
+          comments: comments,
+          comments_if_open: comments_if_open
+        }

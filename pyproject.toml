@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "wize-jmes-adapter"
+version = "0.1.0"
+description = "Generic JMESPath-based API adapter for dynamic API orchestration"
+authors = ["Raghawendra <raghwendra.sharan@networkwize.com>"]
+readme = "README.md"
+packages = [
+    { include = "wize_jmes_adapter" }
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+httpx = "^0.27.0"
+jmespath = "^1.0.1"
+tenacity = "^8.2.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

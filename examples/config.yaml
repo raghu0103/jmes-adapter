@@ -1,0 +1,27 @@
+version: 1.0
+
+operations:
+
+  sample_operation:
+
+    operation:
+      type: REST
+      details:
+        route: "https://api.example.com/data"
+        method: POST
+
+        headers:
+          required:
+            Content-Type: "application/json"
+          runtime:
+            Authorization: "${auth_token}"
+
+        data:
+          limit: 10
+
+    response:
+      expression: >
+        items[].{
+          id: id,
+          name: name || 'NA'
+        }

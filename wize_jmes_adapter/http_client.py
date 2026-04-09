@@ -88,8 +88,15 @@ async def call_api(operation_config, context):
             )
 
             logger.debug("Response status: %s", response.status_code)
-
-            return response.json()
+            # print("\n===== RAW RESPONSE =====")
+            # print("Status:", response.status_code)
+            # print("Text:", response.text[:1000])
+            # print("========================\n")
+            try:
+                return response.json()
+            except Exception:
+                # fallback for plain text (like SMAX auth token)
+                return response.text
 
     except httpx.HTTPStatusError as e:
         logger.error("HTTP error: %s - %s", e.response.status_code, e.response.text)

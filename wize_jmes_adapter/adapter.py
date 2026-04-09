@@ -1,202 +1,210 @@
+import asyncio
+import copy
 import jmespath
 import logging
 from .config_loader import load_config
 from .http_client import call_api
-import asyncio
 
 logger = logging.getLogger(__name__)
 
 
 class Adapter:
-
     def __init__(self, config_path):
         self.config = load_config(config_path)
-        self._compiled_expressions = {}
+        self._compiled = {}
 
     # -------------------------------
-    # Get operation config
+    # Utils
     # -------------------------------
+    def _compile(self, key, expr):
+        if key not in self._compiled:
+            self._compiled[key] = jmespath.compile(expr)
+        return self._compiled[key]
+
+    def _normalize(self, result):
+        if result is None:
+            return []
+        if isinstance(result, dict):
+            return [result]
+        return result
+
     def _get_operation(self, operation):
-        operations = self.config.get("operations", {})
-        if operation not in operations:
+        ops = self.config.get("operations", {})
+        if operation not in ops:
             raise ValueError(f"Operation '{operation}' not found in config")
-        return operations[operation]
+        return ops[operation]
+
+    def _resolve(self, expr, item, results, context):
+        if not isinstance(expr, str):
+            return expr
+
+        if expr.startswith("item."):
+            return jmespath.search(expr[5:], item)
+
+        if expr.startswith("results."):
+            return jmespath.search(expr[8:], results)
+
+        if expr.startswith("context."):
+            return jmespath.search(expr[8:], context)
+
+        return expr
+
+    def _build_context(self, base, mapping, item, results):
+        ctx = copy.deepcopy(base)
+        for k, v in (mapping or {}).items():
+            value = self._resolve(v, item, results, base)
+
+            if value is None:
+                raise ValueError(f"Context mapping failed for key '{k}' (got None)")
+
+            ctx[k] = value
+        return ctx
 
     # -------------------------------
-    # Compile & cache JMESPath
+    # Auth Handler
     # -------------------------------
-    def _get_compiled_expression(self, operation, expression):
-        key = f"{operation}:{expression}"
+    async def _handle_auth(self, operation, context, results):
+        auth_cfg = self.config.get("auth")
+        if not auth_cfg or not auth_cfg.get("enabled"):
+            return context
 
-        if key not in self._compiled_expressions:
-            self._compiled_expressions[key] = jmespath.compile(expression)
+        if operation in auth_cfg.get("skip_for", []):
+            return context
 
-        return self._compiled_expressions[key]
+        # skip if already present
+        if all(context.get(k) for k in auth_cfg.get("result_map", {})):
+            return context
 
-    # -------------------------------
-    # Apply selector (GENERIC)
-    # -------------------------------
-    def _apply_selector(self, response, selector, context):
-        if not selector:
-            return response
+        auth_ctx = self._build_context(
+            context,
+            auth_cfg.get("context_map"),
+            None,
+            results
+        )
 
-        try:
-            selector_str = selector
+        auth_result = await self.run(auth_cfg["operation"], auth_ctx, results)
 
-            # Inject variables like ${ticket_id}
-            if isinstance(selector_str, str):
-                for key, value in context.items():
-                    selector_str = selector_str.replace(f"${{{key}}}", str(value))
-                # If variable not resolved → skip selector
-                if "${" in selector_str:
-                    logger.debug(
-                        "Skipping selector due to missing context variable: %s",
-                        selector
-                    )
-                    return response
-            else:
-                return response
+        enriched = copy.deepcopy(context)
+        for k, expr in auth_cfg["result_map"].items():
+            enriched[k] = jmespath.search(expr, auth_result)
 
-            logger.debug("Applying selector: %s", selector_str)
-
-            # Fast path: direct key access
-            if isinstance(response, dict) and "." not in selector_str and selector_str in response:
-                return response.get(selector_str, [])
-
-            # Fallback: JMESPath selector
-            # return jmespath.search(selector_str, response)
-            selected = jmespath.search(selector_str, response)
-            return selected if selected is not None else response
-
-        except Exception as e:
-            logger.warning("Selector failed, returning original response: %s", e)
-            return response
+        return enriched
 
     # -------------------------------
-    # Main execution
+    # Operation Execution
     # -------------------------------
+    async def _run_transform(self, operation, op, context, results):
+        source = op["operation"].get("source", "results")
 
-    async def run(self, operation, context=None, raw_response=None):
+        payload = jmespath.search(source, {
+            "context": context,
+            "results": results
+        })
+
+        expr = op["response"]["expression"]
+        result = self._compile(operation, expr).search(payload)
+
+        return self._normalize(result)
+
+    async def _run_single(self, operation, op, context, results):
+        context = await self._handle_auth(operation, context, results)
+
+        op_cfg = op.get("operation", {})
+        op_type = op_cfg.get("type", "REST").upper()
+
+        if op_type == "TRANSFORM":
+            return await self._run_transform(operation, op, context, results)
+
+        response = await call_api(op_cfg, context)
+
+        expr = op["response"]["expression"]
+        result = self._compile(operation, expr).search(response)
+
+        return self._normalize(result)
+
+    # -------------------------------
+    # Workflow Execution
+    # -------------------------------
+    async def _run_step(self, step, results, context):
+        name = step["name"]
+        operation = step["operation"]
+
+        ctx = self._build_context(context, step.get("context_map"), None, results)
+
+        result = await self.run(operation, ctx, results)
+
+        return name, result
+
+    async def _run_parallel(self, steps, results, context):
+        tasks = [self._run_step(s, results, context) for s in steps]
+        out = await asyncio.gather(*tasks)
+        return dict(out)
+
+    async def _run_for_each(self, step, results, context):
+        collection_name = step["for_each"]
+
+        collection = results.get(collection_name)
+        if collection is None:
+            raise ValueError(f"for_each target '{collection_name}' not found in results")
+
+        if not isinstance(collection, list):
+            raise ValueError(f"for_each target '{collection_name}' must be a list")
+
+        async def run_one(item):
+            ctx = self._build_context(context, step.get("context_map"), item, results)
+            return await self.run(step["operation"], ctx, results)
+
+        if step.get("parallel", True):
+            tasks = [run_one(item) for item in collection]
+            outputs = await asyncio.gather(*tasks)
+        else:
+            outputs = []
+            for item in collection:
+                outputs.append(await run_one(item))
+
+        flattened = [x for sub in outputs for x in sub]
+        return flattened
+
+    async def _run_workflow(self, operation, op, context):
+        steps = op["workflow"]["steps"]
+        results = {}
+
+        for step in steps:
+
+            # ---------------- parallel_group
+            if "parallel_group" in step:
+                results.update(await self._run_parallel(step["parallel_group"], results, context))
+                continue
+
+            # ---------------- for_each
+            if "for_each" in step:
+                name = step["name"]
+                results[name] = await self._run_for_each(step, results, context)
+                continue
+
+            # ---------------- normal step
+            name, res = await self._run_step(step, results, context)
+            results[name] = res
+
+        expr = op["workflow"].get("response", {}).get("expression")
+
+        if expr:
+            final = self._compile(operation, expr).search(results)
+        else:
+            final = results
+
+        return self._normalize(final)
+
+    # -------------------------------
+    # Entry Point
+    # -------------------------------
+    async def run(self, operation, context=None, results=None):
         context = context or {}
+        results = results or {}
 
-        try:
-            op = self._get_operation(operation)
+        op = self._get_operation(operation)
 
-            # ===============================
-            # MULTI-STEP EXECUTION
-            # ===============================
-            if "steps" in op:
-                logger.debug("Executing multi-step operation: %s", operation)
+        if "workflow" in op:
+            return await self._run_workflow(operation, op, context)
 
-                results = {}
-                parallel_steps = []
-                parallel_names = []
-
-                for step in op["steps"]:
-                    step_name = step["name"]
-                    step_operation = step["operation"]
-                    condition = step.get("condition")
-
-                    # Steps with condition depend on previous results,
-                    # so execute them sequentially.
-                    if condition:
-                        if not results:
-                            logger.debug("Skipping conditional step %s due to missing dependencies", step_name)
-                            continue
-                        try:
-                            condition_result = jmespath.search(condition, results)
-                            logger.debug(
-                                "Condition for step %s -> %s = %s",
-                                step_name, condition, condition_result
-                            )
-
-                            if not condition_result:
-                                logger.debug("Skipping step: %s", step_name)
-                                continue
-
-                        except Exception as e:
-                            logger.warning(
-                                "Condition evaluation failed for step %s: %s",
-                                step_name,
-                                e,
-                            )
-                            continue
-
-                        logger.debug("Running conditional step sequentially: %s", step_name)
-                        step_result = await self.run(step_operation, context=context)
-                        results[step_name] = step_result
-                        continue
-
-                    # Steps without condition are treated as independent
-                    # and can be executed in parallel.
-                    parallel_steps.append(
-                        asyncio.create_task(self.run(step_operation, context=context))
-                    )
-                    parallel_names.append(step_name)
-
-                # Run all independent steps in parallel
-                if parallel_steps:
-                    logger.debug(
-                        "Running %d parallel steps for operation: %s",
-                        len(parallel_steps),
-                        operation,
-                    )
-                    parallel_results = await asyncio.gather(*parallel_steps)
-
-                    for step_name, step_result in zip(parallel_names, parallel_results):
-                        results[step_name] = step_result
-
-                # Apply final transformation to collected step results
-                expression = op.get("response", {}).get("expression")
-
-                if expression:
-                    compiled = self._get_compiled_expression(operation, expression)
-                    result = compiled.search(results)
-                else:
-                    result = results
-
-                logger.debug(
-                    "Multi-step JMESPath result for %s: %s",
-                    operation,
-                    str(result)[:500],
-                )
-
-                if isinstance(result, dict):
-                    result = [result]
-
-                return result
-
-            # ===============================
-            # NORMAL SINGLE OPERATION
-            # ===============================
-            if raw_response is not None:
-                response = raw_response
-                logger.debug("Using raw_response for operation: %s", operation)
-            else:
-                operation_config = op.get("operation")
-                if not operation_config:
-                    raise ValueError(f"No operation config found for '{operation}'")
-
-                logger.debug("Calling API for operation: %s", operation)
-                response = await call_api(operation_config, context)
-
-            selector = op.get("response", {}).get("selector")
-            response = self._apply_selector(response, selector, context)
-
-            expression = op.get("response", {}).get("expression")
-            if not expression:
-                raise ValueError(f"No JMESPath expression found for operation '{operation}'")
-
-            compiled = self._get_compiled_expression(operation, expression)
-            result = compiled.search(response)
-
-            logger.debug("JMESPath result for %s: %s", operation, str(result)[:500])
-
-            if isinstance(result, dict):
-                result = [result]
-
-            return result
-
-        except Exception as e:
-            logger.exception("Error executing operation '%s'", operation)
-            raise RuntimeError(f"[Adapter:{operation}] {str(e)}")
+        return await self._run_single(operation, op, context, results)

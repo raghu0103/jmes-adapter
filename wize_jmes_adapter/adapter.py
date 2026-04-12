@@ -226,7 +226,7 @@ class Adapter:
         response_cfg = op.get("response", {}) or op.get("workflow", {}).get("response", {})
 
         if "template" in response_cfg:
-            final = self.template.render(response_cfg["template"], None, {"results": results}, context)
+            final = self.template.render(response_cfg["template"], None, results, context)
             self.debugger.log("FINAL TEMPLATE OUTPUT", final)
             return self._normalize(final)
 

@@ -1,1268 +1,259 @@
-# JMES Adapter Library
+# Wize JMES Adapter
 
-A configuration-driven integration adapter for orchestrating vendor APIs, transforming responses with JMESPath, and composing multi-step workflows without writing vendor-specific Python logic.
+A configuration-driven orchestration engine to:
 
-This library is designed for use cases where:
+- Call APIs (REST)
+- Transform data (JMESPath)
+- Chain workflows
+- Run parallel operations
+- Apply business logic (risk, scoring, decisions)
+- Build UI-ready responses
 
-- different vendors expose different APIs and payload formats,
-- we want one reusable execution engine,
-- configuration should drive behavior,
-- workflows may involve dependent steps, transformations, authentication, and parallel branches.
-
----
-
-## 1. What this library solves
-
-In most integration projects, the hard part is not only calling an API. The real complexity comes from:
-
-- mapping vendor-specific responses into a common shape,
-- chaining multiple APIs together,
-- generating request bodies from outputs of previous APIs,
-- handling authentication consistently,
-- reusing the same engine across domains like ITSM, banking, governance, analytics, and operations.
-
-This adapter solves that by making the behavior configuration-driven.
-
-Instead of writing custom Python for every vendor flow, you define:
-
-- the operation to call,
-- the request payload to send,
-- the JMESPath expression to normalize the response,
-- the workflow steps to orchestrate,
-- the data dependencies between steps,
-- parallel branches when independent steps can run together.
+All **without writing vendor-specific Python code**.
 
 ---
 
-## 2. Core design principles
+# 🚀 1. What this library solves
 
-The library follows these design principles:
+Instead of writing custom code for every API integration, you define everything in YAML:
 
-### 2.1 Configuration over code
-New vendors or workflows should mostly be added through YAML, not by editing Python execution logic.
-
-### 2.2 JMESPath as the transformation engine
-Every response normalization and most derived data generation should happen through JMESPath expressions.
-
-### 2.3 Separation of concerns
-The adapter should clearly separate:
-
-- API execution,
-- response selection,
-- response transformation,
-- workflow orchestration,
-- authentication handling.
-
-### 2.4 Reusability
-An operation should be reusable as:
-
-- a standalone API call,
-- a step inside a workflow,
-- a child branch inside a parallel group.
-
-### 2.5 Minimal payload passing
-Wherever possible, downstream operations should receive only the specific keys they need, not full upstream payloads.
-
-This is especially important in banking and other regulated workflows.
+- API calls
+- Request payloads
+- Response mapping
+- Workflow orchestration
+- Business logic (risk, scoring, decisions)
 
 ---
 
-## 3. Supported concepts
+# 🧠 2. Core Concepts
 
-The adapter supports the following major concepts.
+### Operation
+Smallest unit of execution
 
-### 3.1 Operation
-An operation is the smallest executable unit.
-
-It can be one of these types:
-
-- `REST` – call an external API
-- `TRANSFORM` – create derived output locally using JMESPath
-- `workflow` – orchestrate multiple operations
-
-### 3.2 Response expression
-Each operation defines a JMESPath expression to normalize the raw response into the exact output required by the system.
-
-### 3.3 Context
-Context is runtime input passed to an operation or workflow.
-
-Examples:
-
-- `tenant_id`
-- `ticket_id`
-- `applicant_id`
-- `username`
-- `password`
-
-### 3.4 Context map
-A `context_map` is used inside workflows to build the input for a child step from:
-
-- top-level context,
-- previous step results,
-- loop item values.
-
-### 3.5 Workflow
-A workflow is a sequence of steps that may include:
-
-- sequential execution,
-- parallel execution,
-- dependent request generation,
-- final aggregation.
-
-### 3.6 Parallel group
-A `parallel_group` lets multiple independent steps run concurrently at the same workflow level.
-
-This is useful when:
-
-- all branches depend on already available inputs,
-- branches do not depend on each other,
-- response time matters.
-
-### 3.7 Centralized authentication
-Authentication can be defined globally so protected operations automatically receive auth values without repeating auth steps inside every workflow.
+Types:
+- `REST` → API call
+- `TRANSFORM` → derive data locally
+- `workflow` → multi-step execution
 
 ---
 
-## 4. Execution model
+### Context
+Runtime input
 
-At a high level, the adapter behaves like this:
+```json
+{
+  "applicant_id": "A123",
+  "tenant_id": "123"
+}
+Context Map
 
-1. Load YAML config.
-2. Identify requested operation.
-3. If it is a workflow, execute its steps in order.
-4. If a step contains a `parallel_group`, execute all branches concurrently.
-5. For normal operations:
-   - resolve auth if required,
-   - build request from context,
-   - call the API,
-   - apply selector if configured,
-   - apply JMESPath response expression,
-   - normalize result to a list.
-6. For `TRANSFORM` operations:
-   - pick a source payload,
-   - run a JMESPath expression on it,
-   - return only the derived fields needed by downstream logic.
-7. Return either the workflow response expression result or the raw accumulated step results.
+Maps data into child step
 
----
+context_map:
+  pan: results.customer_data[0].pan
 
-## 5. Result normalization behavior
+Workflow
+Sequence of steps
 
-The adapter normalizes results consistently:
+workflow:
+  steps:
+    - name: customer
+      operation: customer_data
 
-- `None` becomes `[]`
-- a single dictionary becomes `[dict]`
-- a list remains a list
+    - parallel_group:
+        - name: experian
+          operation: experian_branch
+        - name: equifax
+          operation: equifax_branch
 
-This helps workflow expressions stay consistent because step outputs can be referenced in a predictable shape.
+⚙️ 3. Execution Flow
+Load YAML
+Identify operation
+Execute steps (sequential / parallel)
+Resolve context
+Call API / transform
+Apply response mapping
+Return final output
 
-For example:
-
-```yaml
-results.ticket[0].id
-results.experian[0].score
-```
-
----
-
-## 6. YAML structure overview
-
-A typical config has this structure:
-
-```yaml
-version: 1.0
-vendor: SOME_VENDOR
-
-auth:
-  enabled: true
-  operation: vendor_auth
-  skip_for:
-    - vendor_auth
-  context_map:
-    username: context.username
-    password: context.password
-  result_map:
-    auth_token: "[0].auth_token"
-
-operations:
-  some_operation:
-    operation:
-      type: REST
-      details:
-        route: "https://example.com/api"
-        method: GET
-        headers:
-          required:
-            Content-Type: "application/json"
-          runtime:
-            Authorization: "${auth_token}"
-    response:
-      expression: "@"
-```
-
-The top-level keys are:
-
-- `version`
-- `vendor`
-- `auth` (optional)
-- `operations`
-
----
-
-## 7. Operation types in detail
-
-## 7.1 REST operation
-
-A REST operation calls an external API.
-
-### Structure
-
-```yaml
-some_rest_operation:
+🔌 4. Operation Types
+  4.1 REST
   operation:
     type: REST
     details:
-      route: "https://example.com/api"
+      route: "https://api.com"
       method: POST
-      timeout: 20
       headers:
         required:
-          Content-Type: "application/json"
-        runtime:
-          Authorization: "${auth_token}"
+          Content-Type: application/json
       data:
         id: "${id}"
+
   response:
     expression: "@"
-```
-
-### Important notes
-
-- `required` headers are static or template-driven headers that should always be sent.
-- `runtime` headers are resolved using runtime context values.
-- `data` is built from context placeholders.
-- `response.expression` defines the normalized output.
-
----
-
-## 7.2 TRANSFORM operation
-
-A TRANSFORM operation does not call an external API. It derives a new payload from already available `context` and `results`.
-
-This is extremely useful when downstream APIs need only a subset of keys from upstream APIs.
-
-### Structure
-
-```yaml
-experian_payload:
+  4.2 TRANSFORM
   operation:
     type: TRANSFORM
     source: "results"
+
   response:
     expression: >
       {
-        applicant_id: customer_data[0].applicant_id,
         pan: customer_data[0].pan,
-        mobile: customer_data[0].mobile,
-        monthly_income: employment_data[0].monthly_income
+        income: employment_data[0].income
       }
-```
-
-### Why TRANSFORM matters
-
-Without this step, downstream bureau APIs often receive too much data or require custom Python glue.
-
-With TRANSFORM:
-
-- only relevant keys are extracted,
-- request payloads are explicit,
-- configs become easier to review,
-- the workflow stays declarative.
-
----
-
-## 7.3 Workflow operation
-
-A workflow operation coordinates multiple operations.
-
-### Structure
-
-```yaml
-some_workflow:
+  4.3 WORKFLOW
   workflow:
     steps:
-      - name: step_1
-        operation: some_operation
-        context_map:
-          id: context.id
+      - name: step1
+        operation: op1
 
       - parallel_group:
-          - name: branch_a
+          - name: a
             operation: op_a
-          - name: branch_b
+          - name: b
             operation: op_b
 
-    response:
-      expression: >
-        {
-          a: branch_a[0],
-          b: branch_b[0]
-        }
-```
+  response:
+    expression: >
+      {
+        a: a[0],
+        b: b[0]
+      }
 
-### Notes
+🔄 5. Result Behavior
 
-- each named step stores its result under `results.<step_name>`
-- `parallel_group` stores each branch result under its branch name
-- final `response.expression` shapes the workflow output
+All outputs are normalized:
 
----
+  Input	Output
+  dict	[dict]
+  list	list
+  None	[]
 
-## 8. Authentication pattern
-
-Authentication should be centralized whenever multiple operations need it.
-
-Instead of explicitly calling auth inside every workflow, define a top-level `auth` block.
-
-### Recommended auth block
-
-```yaml
+🔐 6. Authentication
 auth:
   enabled: true
-  operation: smax_auth_token
-  skip_for:
-    - smax_auth_token
+  operation: login_api
   context_map:
-    tenant_id: context.tenant_id
-    jsession_id: context.jsession_id
     username: context.username
     password: context.password
   result_map:
-    auth_token: "[0].auth_token"
-    lwsso_cookie: "[0].auth_token"
-```
+    token: "[0].token"
 
-### How it works
-
-When a protected operation runs:
-
-1. adapter checks whether auth is enabled,
-2. adapter skips auth operation itself,
-3. adapter checks whether auth values are already present in context,
-4. if not, it runs the configured auth operation,
-5. it maps auth response fields into context,
-6. protected operation executes using those values.
-
-### Benefits
-
-- no repeated auth step definitions,
-- less workflow duplication,
-- more reusable operations,
-- cleaner configs.
-
----
-
-## 9. Context mapping rules
-
-The adapter supports these expression prefixes in `context_map`.
-
-### `context.`
-Read from incoming workflow context.
-
-Example:
-
-```yaml
-applicant_id: context.applicant_id
-```
-
-### `results.`
-Read from previous workflow step results.
-
-Example:
-
-```yaml
-pan: results.customer_data[0].pan
-```
-
-### `item.`
-Used in loop-based execution where each item is processed individually.
-
-Example:
-
-```yaml
-ticket_id: item.id
-```
-
----
-
-## 10. Parallel execution pattern
-
-Parallel execution should be used only when branches are independent.
-
-### Recommended use cases
-
-- multiple bureau score APIs based on already collected customer data
-- fetching ticket summary and comments together
-- independent enrichments on the same base object
-
-### Example
-
-```yaml
+⚡ 7. Parallel Execution
 - parallel_group:
     - name: experian
       operation: experian_branch
     - name: equifax
       operation: equifax_branch
-    - name: transunion
-      operation: transunion_branch
-    - name: crif
-      operation: crif_branch
-```
 
-### When not to use parallel execution
+🧩 8. YAML Functions
+  Conditional
+  functions:
+    risk_band:
+      type: conditional
+      params: [score]
+      rules:
+        - when: "score >= 750"
+          value: "LOW"
+        - when: "score >= 650"
+          value: "MEDIUM"
+        - when: "true"
+          value: "HIGH"
+  Formula
+  functions:
+    confidence:
+      type: formula
+      params: [score]
+      expression: "min(score / 900, 1)"
+  Mapping
+  functions:
+    decision_label:
+      type: mapping
+      params: [value]
+      map:
+        1: "APPROVED"
+        0: "REJECTED"
+
+🧠 9. Using Functions
+    risk: "risk_band(results.score[0])"
+    confidence: "confidence(results.score[0])"
+
+🎯 10. Template-Based Output
+response:
+  template:
+    applicant:
+      pan: "results.customer[0].pan"
+
+    scores:
+      experian: "results.experian[0].score"
+
+    risk:
+      experian: "risk_band(results.experian[0].score)"
+
+🔍 11. Expression Types
+      Type	Example
+      context	context.applicant_id
+      results	results.customer[0].pan
+      item	item.id
+      template	${auth_token}
+      function	risk_band(score)
+🐞 12. Debug Mode
+
+  await adapter.run("workflow_name", context=context, debug=True)
+
+🛡️ 13. Validation
+
+    Validates:
+
+      operations
+      workflows
+      functions
+      auth
+
+🏦 14. Example Flow
+      fetch data
+      transform payload
+      call APIs (parallel)
+      compute decision
+
+
+▶️ 15. How to Use
+    Initialize
+      from wize_jmes_adapter import Adapter
+
+      adapter = Adapter("config.yaml")
+
+    Run
+      result = await adapter.run(
+          "banking_underwriting_workflow",
+          context={"applicant_id": "A123"}
+      )
+
+    Debug
+      await adapter.run("workflow", context=context, debug=True)
+
+✅ 16. Best Practices
+      Keep operations small
+      Use TRANSFORM for payloads
+      Use YAML for logic
+      Avoid API-layer processing
+      Keep response UI-ready
+
+❌ 17. Common Mistakes
+      Mixing raw + processed data
+      Overloading context
+      Using parallel for dependent steps
+      Writing logic in Python instead of YAML
+
+🎯 Final Summary
 
-Do not use parallel execution if:
+    This is not just an adapter.
 
-- one branch depends on another branch’s output,
-- ordering matters,
-- the vendor imposes strict sequencing,
-- shared mutable state would cause ambiguity.
+    It is a:
 
----
+      Workflow Engine
+      Transformation Engine
+      Decision Engine
+      Low-code Integration Framework
 
-## 11. Scenario 1: SMAX integration pattern
-
-This scenario shows how to build a vendor config where:
-
-- authentication is required for all business operations,
-- ticket summary and comments are independent after auth,
-- the workflow should expose both ticket and comments together.
-
-### SMAX YAML example
-
-```yaml
-version: 1.0
-vendor: SMAX
-
-auth:
-  enabled: true
-  operation: smax_auth_token
-  skip_for:
-    - smax_auth_token
-  context_map:
-    tenant_id: context.tenant_id
-    jsession_id: context.jsession_id
-    username: context.username
-    password: context.password
-  result_map:
-    auth_token: "[0].auth_token"
-    lwsso_cookie: "[0].auth_token"
-
-operations:
-
-  smax_auth_token:
-    operation:
-      type: REST
-      details:
-        route: "https://us7-smax.saas.microfocus.com/auth/authentication-endpoint/authenticate/token?TENANTID=${tenant_id}"
-        method: POST
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-            Cookie: "JSESSIONID=${jsession_id}; TENANTID=${tenant_id}"
-        data:
-          login: "${username}"
-          password: "${password}"
-    response:
-      expression: >
-        {
-          auth_token: @
-        }
-
-  smax_ticket_list:
-    operation:
-      type: REST
-      details:
-        route: "https://decurrent-archiplasmic-myrtle.ngrok-free.dev/tickets/ticket-list"
-        method: GET
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-            Cookie: "LWSSO_COOKIE_KEY=${lwsso_cookie}; JSESSIONID=${jsession_id}; TENANTID=${tenant_id}"
-          runtime:
-            Authorization: "${auth_token}"
-    response:
-      expression: >
-        entities[].{
-          id: properties.Id,
-          title: properties.DisplayLabel || 'NA',
-          description: properties.Description || '',
-          status: properties.Status || 'Unknown',
-          priority: properties.Priority || 'NA',
-          created_at: properties.CreateTime || properties.EmsCreationTime,
-          updated_at: properties.LastUpdateTime || null,
-          requested_by: properties.RequestedByPerson || null,
-          assignment: properties.CurrentAssignment || 'Unassigned'
-        }
-
-  smax_ticket_summary:
-    operation:
-      type: REST
-      details:
-        route: "https://us7-smax.saas.microfocus.com/rest/${tenant_id}/ems/Request/${ticket_id}?layout=FULL_LAYOUT"
-        method: GET
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-            Cookie: "LWSSO_COOKIE_KEY=${lwsso_cookie}; JSESSIONID=${jsession_id}; TENANTID=${tenant_id}"
-          runtime:
-            Authorization: "${auth_token}"
-    response:
-      expression: >
-        entities[].{
-          id: properties.Id,
-          title: properties.DisplayLabel || 'NA',
-          description: properties.Description || '',
-          status: properties.Status || 'Unknown',
-          priority: properties.Priority || 'NA',
-          created_at: properties.CreateTime || properties.EmsCreationTime,
-          updated_at: properties.LastUpdateTime || null,
-          requested_by: properties.RequestedByPerson || null,
-          requested_for: properties.RequestedForPerson || null,
-          assignment: properties.CurrentAssignment || 'Unassigned',
-          phase: properties.PhaseId || null,
-          sla_status: related_properties.SLT.Status || 'Unknown',
-          sla_target: related_properties.SLT.TargetDate || null,
-          sla_target_date: related_properties.SLT.SLATargetDate || null,
-          ola_target: related_properties.SLT.OLATargetDate || null
-        }
-
-  smax_ticket_comments:
-    operation:
-      type: REST
-      details:
-        route: "https://decurrent-archiplasmic-myrtle.ngrok-free.dev/tickets/comments-list"
-        method: GET
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-            Cookie: "LWSSO_COOKIE_KEY=${lwsso_cookie}; JSESSIONID=${jsession_id}; TENANTID=${tenant_id}"
-          runtime:
-            Authorization: "${auth_token}"
-    response:
-      selector: "${ticket_id}"
-      expression: >
-        [].{
-          id: Id,
-          body: Body || '',
-          comment_type: CommentFrom || 'Unknown',
-          author: Submitter.UserId || 'Unknown',
-          is_system: IsSystem || false,
-          created_at: CreateTime || null,
-          updated_at: UpdateTime || null,
-          functional_type: FunctionalPurpose || null,
-          media: Media || null
-        }
-
-  smax_ticket_full:
-    workflow:
-      steps:
-        - parallel_group:
-            - name: ticket
-              operation: smax_ticket_summary
-              context_map:
-                tenant_id: context.tenant_id
-                jsession_id: context.jsession_id
-                ticket_id: context.ticket_id
-
-            - name: comments
-              operation: smax_ticket_comments
-              context_map:
-                tenant_id: context.tenant_id
-                jsession_id: context.jsession_id
-                ticket_id: context.ticket_id
-
-      response:
-        expression: >
-          {
-            ticket: ticket[0],
-            comments: comments
-          }
-```
-
-### Why this pattern works
-
-- auth is not repeated inside every workflow,
-- all protected operations can reuse centralized auth,
-- ticket summary and comments are independent, so they can run in parallel,
-- the final workflow response is already normalized for downstream consumers.
-
-### Typical runtime input
-
-```json
-{
-  "tenant_id": "126886739",
-  "jsession_id": "abc123",
-  "username": "user@example.com",
-  "password": "secret",
-  "ticket_id": "14067"
-}
-```
-
----
-
-## 12. Scenario 2: Banking underwriting with dependent request generation
-
-This scenario shows a more advanced pattern where:
-
-- bureau request payloads should not come directly from raw context,
-- request fields must be generated from other APIs,
-- only related keys should be forwarded to each bureau,
-- independent bureau branches should run in parallel.
-
-### Banking YAML example
-
-```yaml
-version: 1.0
-vendor: BANKING
-
-operations:
-
-  customer_data:
-    operation:
-      type: REST
-      details:
-        route: "https://bank.example.com/customer/profile"
-        method: POST
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-        data:
-          applicant_id: "${applicant_id}"
-    response:
-      expression: >
-        {
-          applicant_id: applicant_id,
-          full_name: full_name,
-          pan: pan,
-          mobile: mobile,
-          dob: dob
-        }
-
-  employment_data:
-    operation:
-      type: REST
-      details:
-        route: "https://bank.example.com/customer/employment"
-        method: POST
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-        data:
-          applicant_id: "${applicant_id}"
-    response:
-      expression: >
-        {
-          employer_name: employer_name,
-          monthly_income: monthly_income,
-          occupation: occupation
-        }
-
-  kyc_data:
-    operation:
-      type: REST
-      details:
-        route: "https://bank.example.com/customer/kyc"
-        method: POST
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-        data:
-          applicant_id: "${applicant_id}"
-    response:
-      expression: >
-        {
-          pan_verified: pan_verified,
-          aadhaar_linked: aadhaar_linked,
-          address: address
-        }
-
-  experian_payload:
-    operation:
-      type: TRANSFORM
-      source: "results"
-    response:
-      expression: >
-        {
-          applicant_id: customer_data[0].applicant_id,
-          pan: customer_data[0].pan,
-          mobile: customer_data[0].mobile,
-          dob: customer_data[0].dob,
-          monthly_income: employment_data[0].monthly_income
-        }
-
-  equifax_payload:
-    operation:
-      type: TRANSFORM
-      source: "results"
-    response:
-      expression: >
-        {
-          applicant_id: customer_data[0].applicant_id,
-          pan: customer_data[0].pan,
-          mobile: customer_data[0].mobile,
-          address: kyc_data[0].address,
-          occupation: employment_data[0].occupation
-        }
-
-  transunion_payload:
-    operation:
-      type: TRANSFORM
-      source: "results"
-    response:
-      expression: >
-        {
-          applicant_id: customer_data[0].applicant_id,
-          pan: customer_data[0].pan,
-          mobile: customer_data[0].mobile,
-          aadhaar_linked: kyc_data[0].aadhaar_linked
-        }
-
-  crif_payload:
-    operation:
-      type: TRANSFORM
-      source: "results"
-    response:
-      expression: >
-        {
-          applicant_id: customer_data[0].applicant_id,
-          pan: customer_data[0].pan,
-          mobile: customer_data[0].mobile,
-          pan_verified: kyc_data[0].pan_verified,
-          monthly_income: employment_data[0].monthly_income
-        }
-
-  experian_score:
-    operation:
-      type: REST
-      details:
-        route: "https://bank.example.com/experian/score"
-        method: POST
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-        data:
-          applicant_id: "${applicant_id}"
-          pan: "${pan}"
-          mobile: "${mobile}"
-          dob: "${dob}"
-          monthly_income: "${monthly_income}"
-    response:
-      expression: >
-        {
-          bureau: 'experian',
-          score: score,
-          risk_band: risk_band,
-          decision_hint: decision_hint
-        }
-
-  equifax_score:
-    operation:
-      type: REST
-      details:
-        route: "https://bank.example.com/equifax/score"
-        method: POST
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-        data:
-          applicant_id: "${applicant_id}"
-          pan: "${pan}"
-          mobile: "${mobile}"
-          address: "${address}"
-          occupation: "${occupation}"
-    response:
-      expression: >
-        {
-          bureau: 'equifax',
-          score: score,
-          risk_band: risk_band,
-          decision_hint: decision_hint
-        }
-
-  transunion_score:
-    operation:
-      type: REST
-      details:
-        route: "https://bank.example.com/transunion/score"
-        method: POST
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-        data:
-          applicant_id: "${applicant_id}"
-          pan: "${pan}"
-          mobile: "${mobile}"
-          aadhaar_linked: "${aadhaar_linked}"
-    response:
-      expression: >
-        {
-          bureau: 'transunion',
-          score: score,
-          risk_band: risk_band,
-          decision_hint: decision_hint
-        }
-
-  crif_score:
-    operation:
-      type: REST
-      details:
-        route: "https://bank.example.com/crif/score"
-        method: POST
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-        data:
-          applicant_id: "${applicant_id}"
-          pan: "${pan}"
-          mobile: "${mobile}"
-          pan_verified: "${pan_verified}"
-          monthly_income: "${monthly_income}"
-    response:
-      expression: >
-        {
-          bureau: 'crif',
-          score: score,
-          risk_band: risk_band,
-          decision_hint: decision_hint
-        }
-
-  experian_branch:
-    workflow:
-      steps:
-        - name: payload
-          operation: experian_payload
-        - name: score
-          operation: experian_score
-          context_map:
-            applicant_id: results.payload[0].applicant_id
-            pan: results.payload[0].pan
-            mobile: results.payload[0].mobile
-            dob: results.payload[0].dob
-            monthly_income: results.payload[0].monthly_income
-      response:
-        expression: >
-          score[0]
-
-  equifax_branch:
-    workflow:
-      steps:
-        - name: payload
-          operation: equifax_payload
-        - name: score
-          operation: equifax_score
-          context_map:
-            applicant_id: results.payload[0].applicant_id
-            pan: results.payload[0].pan
-            mobile: results.payload[0].mobile
-            address: results.payload[0].address
-            occupation: results.payload[0].occupation
-      response:
-        expression: >
-          score[0]
-
-  transunion_branch:
-    workflow:
-      steps:
-        - name: payload
-          operation: transunion_payload
-        - name: score
-          operation: transunion_score
-          context_map:
-            applicant_id: results.payload[0].applicant_id
-            pan: results.payload[0].pan
-            mobile: results.payload[0].mobile
-            aadhaar_linked: results.payload[0].aadhaar_linked
-      response:
-        expression: >
-          score[0]
-
-  crif_branch:
-    workflow:
-      steps:
-        - name: payload
-          operation: crif_payload
-        - name: score
-          operation: crif_score
-          context_map:
-            applicant_id: results.payload[0].applicant_id
-            pan: results.payload[0].pan
-            mobile: results.payload[0].mobile
-            pan_verified: results.payload[0].pan_verified
-            monthly_income: results.payload[0].monthly_income
-      response:
-        expression: >
-          score[0]
-
-  approve_decline_model:
-    operation:
-      type: REST
-      details:
-        route: "https://bank.example.com/approve-decline"
-        method: POST
-        timeout: 20
-        headers:
-          required:
-            Content-Type: "application/json"
-        data:
-          applicant_id: "${applicant_id}"
-          experian_score: "${experian_score}"
-          equifax_score: "${equifax_score}"
-          transunion_score: "${transunion_score}"
-          crif_score: "${crif_score}"
-    response:
-      expression: >
-        {
-          decision: decision,
-          confidence: confidence,
-          reason_codes: reason_codes
-        }
-
-  banking_underwriting_workflow:
-    workflow:
-      steps:
-        - name: customer_data
-          operation: customer_data
-          context_map:
-            applicant_id: context.applicant_id
-
-        - name: employment_data
-          operation: employment_data
-          context_map:
-            applicant_id: context.applicant_id
-
-        - name: kyc_data
-          operation: kyc_data
-          context_map:
-            applicant_id: context.applicant_id
-
-        - parallel_group:
-            - name: experian
-              operation: experian_branch
-            - name: equifax
-              operation: equifax_branch
-            - name: transunion
-              operation: transunion_branch
-            - name: crif
-              operation: crif_branch
-
-        - name: final_decision
-          operation: approve_decline_model
-          context_map:
-            applicant_id: context.applicant_id
-            experian_score: results.experian[0].score
-            equifax_score: results.equifax[0].score
-            transunion_score: results.transunion[0].score
-            crif_score: results.crif[0].score
-
-      response:
-        expression: >
-          {
-            customer_data: customer_data[0],
-            employment_data: employment_data[0],
-            kyc_data: kyc_data[0],
-            experian: experian[0],
-            equifax: equifax[0],
-            transunion: transunion[0],
-            crif: crif[0],
-            final_decision: final_decision[0]
-          }
-```
-
-### Why this pattern works
-
-- upstream APIs gather the base information,
-- each bureau gets only the fields relevant to it,
-- request creation is explicit and auditable,
-- all bureau branches are parallelized,
-- the final decision model consumes normalized bureau scores.
-
-### Typical runtime input
-
-```json
-{
-  "applicant_id": "A12345"
-}
-```
-
----
-
-## 13. Additional configuration scenarios
-
-## 13.1 Standalone operation scenario
-
-Sometimes you only want to execute one operation without a workflow.
-
-Example:
-
-- `smax_ticket_list`
-- `customer_data`
-- `experian_score` when payload is already available in context
-
-This works because operations are first-class reusable units.
-
----
-
-## 13.2 Workflow with derived payload generation
-
-Use this when:
-
-- one API gives broad data,
-- another API needs only selected fields,
-- you want explicit payload control.
-
-Pattern:
-
-1. collect source data,
-2. transform selected fields,
-3. call target API.
-
----
-
-## 13.3 Workflow with centralized auth and parallel fetch
-
-Use this when:
-
-- auth is shared,
-- protected calls are independent,
-- response time matters.
-
-Pattern:
-
-1. auth is resolved automatically,
-2. independent operations run in parallel,
-3. workflow aggregates results.
-
----
-
-## 13.4 Branch workflow per vendor endpoint family
-
-This is useful when a branch itself needs multiple internal steps.
-
-For example, each bureau branch may:
-
-1. derive bureau-specific payload,
-2. call bureau endpoint,
-3. apply post-response normalization.
-
-This keeps the top-level workflow clean.
-
----
-
-## 14. Best practices
-
-### 14.1 Keep operations small and reusable
-A config becomes easier to maintain when each operation has a single clear responsibility.
-
-### 14.2 Use TRANSFORM for request-body creation
-Do not overload `context_map` with too much request-building logic.
-
-### 14.3 Pass minimal keys downstream
-Only pass what the child operation needs.
-
-### 14.4 Normalize early
-Make raw vendor payloads easier to consume by normalizing them as soon as possible.
-
-### 14.5 Use parallel groups only for independent branches
-If a branch depends on another branch, keep them sequential.
-
-### 14.6 Keep final workflow response consumer-friendly
-The final workflow response should be shaped for the downstream application, not merely a dump of step internals.
-
-### 14.7 Centralize auth whenever possible
-If multiple operations use the same auth model, keep auth at top-level config.
-
----
-
-## 15. Common mistakes to avoid
-
-### 15.1 Mixing raw and normalized structures
-If one step returns normalized data and another step expects raw vendor structure, JMESPath references will break.
-
-### 15.2 Passing too much data
-Large unfiltered payloads make workflows harder to audit and debug.
-
-### 15.3 Hiding transformation logic in too many places
-Prefer one explicit TRANSFORM step instead of spreading payload generation across many mappings.
-
-### 15.4 Using parallel execution for dependent steps
-Parallel groups should only contain independent branches.
-
-### 15.5 Duplicating auth logic inside workflows
-Once centralized auth is introduced, avoid manually calling auth inside every workflow.
-
----
-
-## 16. Recommended future enhancements
-
-The current design is strong, but these additions would make it even more production-ready.
-
-### 16.1 Token caching
-Avoid calling auth for every protected operation when tokens can be reused safely.
-
-### 16.2 Retry policies per operation
-Allow config-level retry behavior for unstable vendor APIs.
-
-### 16.3 Conditional step execution
-Support explicit step conditions for more advanced branching.
-
-### 16.4 Error handling strategy in parallel groups
-Allow configuration for:
-
-- fail-fast,
-- partial success,
-- fallback behavior.
-
-### 16.5 Post-processing hooks
-In some scenarios, a small amount of optional Python enrichment may still be useful after JMES normalization.
-
----
-
-## 17. Summary
-
-This library is not just an API wrapper. It is a configuration-driven orchestration engine.
-
-Its real strength comes from combining these capabilities:
-
-- REST execution,
-- JMESPath normalization,
-- derived payload generation,
-- reusable operations,
-- centralized authentication,
-- parallel workflow branches.
-
-For SMAX, the right pattern is:
-
-- centralized auth,
-- reusable protected operations,
-- parallel summary and comments fetch.
-
-For banking, the right pattern is:
-
-- collect source data first,
-- generate bureau-specific request payloads through TRANSFORM,
-- send only related keys to each bureau,
-- parallelize independent bureau branches,
-- aggregate into final decision response.
-
-When these patterns are followed consistently, the adapter becomes flexible, reviewable, and reusable across multiple domains.
-
----
-
-## ▶️ Execution / How to Use
-
-# JMES Adapter Library
-
-(Updated with Execution Examples)
-
----
-
-## ▶️ How to Execute Adapter
-
-### 1. Initialize Adapter
-
-```python
-from adapter import Adapter
-
-adapter = Adapter("config.yaml")
-```
-
----
-
-### 2. Run SMAX Workflow
-
-```python
-import asyncio
-
-async def main():
-    result = await adapter.run(
-        "smax_ticket_full",
-        context={
-            "tenant_id": "126886739",
-            "jsession_id": "abc123",
-            "username": "user@example.com",
-            "password": "secret",
-            "ticket_id": "14067"
-        }
-    )
-    print(result)
-
-asyncio.run(main())
-```
-
----
-
-### 3. Run Banking Workflow
-
-```python
-import asyncio
-
-async def main():
-    result = await adapter.run(
-        "banking_underwriting_workflow",
-        context={
-            "applicant_id": "A12345"
-        }
-    )
-    print(result)
-
-asyncio.run(main())
-```
-
----
-
-### 4. Optional: Skip Auth (Token Already Available)
-
-```python
-result = await adapter.run(
-    "smax_ticket_summary",
-    context={
-        "tenant_id": "126886739",
-        "jsession_id": "abc123",
-        "auth_token": "existing-token",
-        "lwsso_cookie": "existing-token",
-        "ticket_id": "14067"
-    }
-)
-```
-
----
-
-## Important Notes
-
-- Adapter automatically handles authentication.
-- All responses are returned as lists.
-- Context is the only input required.
-- Results flow automatically across workflow steps.
-
----
-
-## Summary
-
-This adapter enables:
-
-- Config-driven API orchestration
-- Parallel execution
-- Centralized authentication
-- Clean payload transformation
+    All powered by YAML.

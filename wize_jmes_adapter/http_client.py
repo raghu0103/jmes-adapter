@@ -2,34 +2,18 @@ import httpx
 import logging
 from tenacity import retry, stop_after_attempt, wait_fixed
 import re
+from wize_jmes_adapter.template_engine import TemplateEngine
 
 logger = logging.getLogger(__name__)
 
 
-def inject(value, context):
-    if isinstance(value, str):
-        matches = re.findall(r"\$\{(.*?)\}", value)
-        for match in matches:
-            replacement = context.get(match, "")
-            value = value.replace(f"${{{match}}}", str(replacement))
-        return value
-
-    if isinstance(value, dict):
-        return {k: inject(v, context) for k, v in value.items()}
-
-    if isinstance(value, list):
-        return [inject(v, context) for v in value]
-
-    return value
-
-
-
-def build_headers(details, context):
+def build_headers(details, context, engine):
     headers = {}
 
     for section in ["required", "runtime", "optional"]:
         for k, v in details.get("headers", {}).get(section, {}).items():
-            val = inject(v, context)
+            # val = inject(v, context)
+            val = engine.render(v, {}, {}, context)
 
             # skip None optional headers
             if val is not None:
@@ -37,14 +21,13 @@ def build_headers(details, context):
 
     return headers
 
+def build_data(details, context, engine, item=None, results=None):
+    return engine.render(details.get("data", {}), item or {}, results or {}, context)
 
-def build_data(details, context):
-    return inject(details.get("data", {}), context)
 
-
-def build_query_params(details, context):
+def build_query_params(details, context, engine, item=None, results=None):
     return {
-        k: inject(v, context)
+        k: engine.render(v, item or {}, results or {}, context)
         for k, v in details.get("queryParams", {}).items()
     }
 
@@ -66,16 +49,17 @@ async def _make_request(client, method, url, headers, params, data):
     return response
 
 
-async def call_api(operation_config, context):
+async def call_api(operation_config, context, item=None, results=None):
 
     details = operation_config["details"]
 
     method = details["method"]
-    url = inject(details["route"], context)
+    engine = TemplateEngine(config={})
 
-    headers = build_headers(details, context)
-    data = build_data(details, context)
-    params = build_query_params(details, context)
+    headers = build_headers(details, context, engine)
+    data = build_data(details, context, engine, item, results)
+    params = build_query_params(details, context, engine, item, results)
+    url = engine.render(details["route"], item or {}, results or {}, context)
 
     timeout = details.get("timeout", 10)
 

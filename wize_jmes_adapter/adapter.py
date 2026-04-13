@@ -53,13 +53,17 @@ class Adapter:
         if expr.startswith("context."):
             return jmespath.search(expr[8:], context)
 
+        # direct context key fallback
+        if expr in context:
+            return context[expr]
+
         return expr
 
     def _build_context(self, base: Dict[str, Any], mapping: Optional[Dict[str, Any]], item: Any, results: Dict[str, Any]) -> Dict[str, Any]:
         ctx = copy.deepcopy(base)
 
         for k, v in (mapping or {}).items():
-            value = self.template._resolve_scalar(v, item, results, base)
+            value = self.template._resolve_scalar(v, item, results, ctx)
 
             if value is None:
                 raise ValueError(f"Context mapping failed for key '{k}' (got None)")
@@ -142,7 +146,8 @@ class Adapter:
         rendered_op_cfg = self.template.render(op_cfg, None, results, context)
         self.debugger.log("RENDERED OP CONFIG", rendered_op_cfg)
 
-        response = await call_api(rendered_op_cfg, context)
+        # FIX: pass results
+        response = await call_api(rendered_op_cfg, context, item=None, results=results)
         self.debugger.log("API RESPONSE", response)
 
         response_cfg = op.get("response", {})

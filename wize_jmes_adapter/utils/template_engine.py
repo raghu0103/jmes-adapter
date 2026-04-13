@@ -1,6 +1,5 @@
 import re
 from typing import Any, Dict, List, Optional
-
 import jmespath
 
 from .debugger import Debugger
@@ -15,6 +14,7 @@ class TemplateEngine:
         self.config = config
         self.func_engine = FunctionEngine(config)
         self.debugger = debugger or Debugger(False)
+        self.strict = config.get("strict", False)
 
     def render(self, obj: Any, item: Any, results: Dict[str, Any], context: Dict[str, Any]) -> Any:
         rendered = self._render_structure(obj, item, results, context)
@@ -60,6 +60,10 @@ class TemplateEngine:
 
         if expr.startswith("context."):
             return jmespath.search(expr[8:], context)
+
+        # direct context key fallback
+        if expr in context:
+            return context[expr]
 
         return None
 
@@ -112,13 +116,15 @@ class TemplateEngine:
         full_match = self.PLACEHOLDER_PATTERN.fullmatch(stripped)
         if full_match:
             inner = full_match.group(1).strip()
+
             ref_value = self._resolve_reference(inner, item, results, context)
             if ref_value is not None:
-                self.debugger.log(f"RESOLVED PLACEHOLDER: {stripped}", ref_value)
                 return ref_value
-            parsed = self._parse_literal(inner)
-            self.debugger.log(f"PARSED PLACEHOLDER LITERAL: {stripped}", parsed)
-            return parsed
+
+            if self.strict:
+                raise Exception(f"Unresolved placeholder: {inner}")
+
+            return self._parse_literal(inner)
 
         fn_match = self.FUNCTION_CALL_PATTERN.match(stripped)
         if fn_match:
@@ -147,14 +153,17 @@ class TemplateEngine:
         if self.PLACEHOLDER_PATTERN.search(stripped):
             def repl(match):
                 inner = match.group(1).strip()
-                ref_value = self._resolve_reference(inner, item, results, context)
-                if ref_value is None:
-                    return match.group(0)
-                return str(ref_value)
 
-            replaced = self.PLACEHOLDER_PATTERN.sub(repl, stripped)
-            self.debugger.log(f"INTERPOLATED STRING: {stripped}", replaced)
-            return replaced
+                ref_value = self._resolve_reference(inner, item, results, context)
+                if ref_value is not None:
+                    return str(ref_value)
+
+                if self.strict:
+                    raise Exception(f"Unresolved variable: {inner}")
+
+                return match.group(0)
+
+            return self.PLACEHOLDER_PATTERN.sub(repl, stripped)
 
         return expr
 

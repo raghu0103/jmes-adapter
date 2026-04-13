@@ -9,12 +9,19 @@ logger = logging.getLogger(__name__)
 def inject(value, context):
     if isinstance(value, str):
         matches = re.findall(r"\$\{(.*?)\}", value)
-
         for match in matches:
-            replacement = str(context.get(match, ""))
-            value = value.replace(f"${{{match}}}", replacement)
+            replacement = context.get(match, "")
+            value = value.replace(f"${{{match}}}", str(replacement))
+        return value
+
+    if isinstance(value, dict):
+        return {k: inject(v, context) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [inject(v, context) for v in value]
 
     return value
+
 
 
 def build_headers(details, context):
@@ -32,10 +39,7 @@ def build_headers(details, context):
 
 
 def build_data(details, context):
-    return {
-        k: inject(v, context)
-        for k, v in details.get("data", {}).items()
-    }
+    return inject(details.get("data", {}), context)
 
 
 def build_query_params(details, context):
